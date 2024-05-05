@@ -9,6 +9,6 @@
 set -e
 (
     cd $(dirname "$0")
-    stack build --copy-bins
+    cabal install --overwrite-policy=always -v0
 )
-exec hs-git-clone-exe "$@"
+exec hs-sqlite-clone-exe "$@"

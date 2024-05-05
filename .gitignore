@@ -1,2 +1,7 @@
 *.db
 dist-newstyle/
+.stack-work/
+.stack/
+.DS_Store
+dist/
+hs-sqlite-clone-exe
