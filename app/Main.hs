@@ -3,6 +3,7 @@
 
 module Main (main) where
 
+import Control.Monad (when)
 import Data.Binary (Binary (get), Word16, Word32, Word64, Word8)
 import Data.Binary.Get qualified as BG
 import Data.Bits (Bits (shiftL, (.&.), (.|.)))
@@ -258,7 +259,17 @@ data TableRecordValue
   | InternalRecord
   | StringRecord Text
   | BlobRecord BL.ByteString
-  deriving (Show)
+
+instance Show TableRecordValue where
+  show :: TableRecordValue -> String
+  show NullRecord = "NUL"
+  show (StringRecord s) = T.unpack s
+  show (Float64Record f) = show f
+  show ZeroRecord = "0"
+  show OneRecord = "1"
+  show InternalRecord = ""
+  show (BlobRecord _) = "<blob>"
+  show r = show $ getIntegerValue r
 
 getIntegerValue :: TableRecordValue -> Word64
 getIntegerValue (Int8Record x) = fromIntegral x
@@ -428,9 +439,27 @@ main = do
         Right Sql.Select{qeSelectList = [(Sql.App [Sql.Name _ "count"] _, _)], qeFrom = [Sql.TRSimple [Sql.Name _ tableName]]} -> do
           n <- selectCountStar dbFilePath (T.fromStrict tableName)
           print n
-        Right Sql.Select{qeSelectList = idens, qeFrom = [Sql.TRSimple [Sql.Name _ tableName]]} -> do
-          let columnNames = (\(Sql.Iden [Sql.Name _ columnName], _) -> T.fromStrict columnName) <$> idens
-          selectColumns dbFilePath (T.fromStrict tableName) columnNames
+        Right
+          Sql.Select
+            { qeSelectList = idens
+            , qeFrom = [Sql.TRSimple [Sql.Name _ tableName]]
+            , qeWhere = whereCond
+            } -> do
+            let columnNames = (\(Sql.Iden [Sql.Name _ columnName], _) -> T.fromStrict columnName) <$> idens
+            selectColumns
+              dbFilePath
+              (T.fromStrict tableName)
+              columnNames
+              ( \values ->
+                  case whereCond of
+                    Just (Sql.BinOp (Sql.Iden [Sql.Name _ name]) [Sql.Name _ "="] (Sql.StringLit "'" "'" s)) ->
+                      case lookup (T.fromStrict name) values of
+                        Just (StringRecord valStr) ->
+                          T.fromStrict s == valStr
+                        _ -> False
+                    Just _ -> error "unsupport"
+                    Nothing -> True
+              )
         Right x -> print x
         x -> do
           error "execute sql error"
@@ -439,8 +468,8 @@ sqlDialet :: Dialect
 sqlDialet =
   ansi2011{diAutoincrement = True}
 
-selectColumns :: FilePath -> Text -> [Text] -> IO ()
-selectColumns dbFilePath tableName columnNames = do
+selectColumns :: FilePath -> Text -> [Text] -> ([(Text, TableRecordValue)] -> Bool) -> IO ()
+selectColumns dbFilePath tableName columnNames pred = do
   content <- BL.readFile dbFilePath
   let (pageSize, table) =
         BG.runGet
@@ -454,42 +483,32 @@ selectColumns dbFilePath tableName columnNames = do
           content
   pageBS <- mmapDbPage dbFilePath pageSize $ _objectRootPage table
   let (_, cells) = BG.runGet (pageParser 0) pageBS
-  let columnIndexes = getColumnIndexes (_objectSql table) columnNames
+  let schemaColumnNames = getSchemaColumnNames (_objectSql table)
+  let columnIndexes = mapMaybe (`elemIndex` schemaColumnNames) columnNames
   mapM_
     ( \case
         TableLeafCell cell payload ->
-          putStrLn $
-            intercalate "|" $
-              fmap
-                ( \i -> case payload !! i of
-                    NullRecord -> "NUL"
-                    StringRecord s -> T.unpack s
-                    Float64Record f -> show f
-                    ZeroRecord -> "0"
-                    OneRecord -> "1"
-                    InternalRecord -> ""
-                    BlobRecord _ -> "<blob>"
-                    r -> show $ getIntegerValue r
-                )
-                columnIndexes
+          ( when (pred (zip schemaColumnNames payload)) $
+              putStrLn $
+                intercalate "|" $
+                  fmap (\i -> show $ payload !! i) columnIndexes
+          )
     )
     cells
  where
-  getColumnIndexes :: Text -> [Text] -> [Int]
-  getColumnIndexes sql columnNames =
-    case Sql.parseStatement sqlDialet "" Nothing $ traceS "sql" (T.toStrict sql) of
+  getSchemaColumnNames :: Text -> [Text]
+  getSchemaColumnNames sql =
+    case Sql.parseStatement sqlDialet "" Nothing $ T.toStrict sql of
       Right (Sql.CreateTable _ columns) ->
-        let schemaColumnNames =
-              mapMaybe
-                ( \case
-                    Sql.TableColumnDef (Sql.ColumnDef (Sql.Name _ name) _ _ _) ->
-                      Just $ T.fromStrict name
-                    _ -> Nothing
-                )
-                columns
-         in mapMaybe (`elemIndex` schemaColumnNames) columnNames
+        mapMaybe
+          ( \case
+              Sql.TableColumnDef (Sql.ColumnDef (Sql.Name _ name) _ _ _) ->
+                Just $ T.fromStrict name
+              _ -> Nothing
+          )
+          columns
       Left err ->
-        error $ show $ Sql.prettyError err
+        []
 
 selectCountStar :: FilePath -> Text -> IO Int
 selectCountStar dbFilePath tableName = do
