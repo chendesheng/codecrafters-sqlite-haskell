@@ -164,6 +164,12 @@ type PageCellPayload = BL.ByteString
 
 type RowId = Int64
 
+data IndexPayload = IndexPayload
+    { _indexPayloadKey :: TableRecordValue -- only one column is supported
+    , _indexPayloadRowId :: TableRecordValue
+    }
+    deriving (Show)
+
 data PageCell
     = TableLeafCell
         { _rowId :: RowId
@@ -173,10 +179,10 @@ data PageCell
         { _leftChildPageNumber :: Word32
         , _rowId :: RowId
         }
-    | IndexLeafCell TableRecord
+    | IndexLeafCell IndexPayload
     | IndexInteriorCell
         { _leftChildPageNumber :: Word32
-        , _payload :: PageCellPayload
+        , _payload :: IndexPayload
         }
     deriving (Show)
 
@@ -228,12 +234,12 @@ pageCellParser pageType = do
             TableInteriorCell leftChildPageNumber <$> signedVariantParser
         IndexLeafPage -> do
             payloadSize <- variantParser
-            IndexLeafCell <$> recordParser
+            IndexLeafCell <$> indexPayloadParser
         IndexInteriorPage -> do
             leftChildPageNumber <- BG.getWord32be
             payloadSize <- variantParser
             payload <- BG.getLazyByteString $ fromIntegral payloadSize
-            pure $ IndexInteriorCell leftChildPageNumber payload
+            IndexInteriorCell leftChildPageNumber <$> indexPayloadParser
 
 pageCellsParser :: Word16 -> PageHeader -> BG.Get [PageCell]
 pageCellsParser offset (PageHeader{_pageType = pageType, _numberOfCells = n, _cellContentAreaStartOffset = contentStartOffset}) = do
@@ -251,12 +257,13 @@ type TableRecord = [TableRecordValue]
 
 data TableRecordValue
     = NullRecord
-    | Int8Record Word8
-    | Int16Record Word16
-    | Int24Record Word32
-    | Int32Record Word32
-    | Int48Record Word64
-    | Int64Record Word64
+    -- | Int8Record Word8
+    -- | Int16Record Word16
+    -- | Int24Record Word32
+    -- | Int32Record Word32
+    -- | Int48Record Word64
+    -- | Int64Record Word64
+    | NumericRecord Word64
     | Float64Record Double
     | ZeroRecord
     | OneRecord
@@ -266,22 +273,14 @@ data TableRecordValue
 
 instance Show TableRecordValue where
     show :: TableRecordValue -> String
-    show NullRecord = "NUL"
+    show NullRecord = "NULL"
     show (StringRecord s) = T.unpack s
     show (Float64Record f) = show f
     show ZeroRecord = "0"
     show OneRecord = "1"
     show InternalRecord = ""
     show (BlobRecord _) = "<blob>"
-    show r = show $ getIntegerValue r
-
-getIntegerValue :: TableRecordValue -> Word64
-getIntegerValue (Int8Record x) = fromIntegral x
-getIntegerValue (Int16Record x) = fromIntegral x
-getIntegerValue (Int32Record x) = fromIntegral x
-getIntegerValue (Int48Record x) = fromIntegral x
-getIntegerValue (Int64Record x) = fromIntegral x
-getIntegerValue _ = error "Value is not integer"
+    show (NumericRecord n) = show n
 
 recordParser :: BG.Get TableRecord
 recordParser = do
@@ -291,14 +290,14 @@ recordParser = do
   where
     valueParser :: Word64 -> BG.Get TableRecordValue
     valueParser typ = do
-        case typ of
+        case traceS "type" typ of
             0 -> pure NullRecord
-            1 -> Int8Record <$> BG.getWord8
-            2 -> Int16Record <$> BG.getWord16be
-            3 -> Int24Record <$> getWord24
-            4 -> Int32Record <$> BG.getWord32be
-            5 -> Int48Record <$> getWord48
-            6 -> Int64Record <$> BG.getWord64be
+            1 -> NumericRecord . fromIntegral <$> BG.getWord8
+            2 -> NumericRecord . fromIntegral <$> BG.getWord16be
+            3 -> NumericRecord . fromIntegral <$> getWord24
+            4 -> NumericRecord . fromIntegral <$> BG.getWord32be
+            5 -> NumericRecord . fromIntegral <$> getWord48
+            6 -> NumericRecord . fromIntegral <$> BG.getWord64be
             7 -> Float64Record <$> BG.getDoublebe
             8 -> pure ZeroRecord
             9 -> pure OneRecord
@@ -333,6 +332,11 @@ recordParser = do
                 (column, consumedSize) <- variantParserWithSize
                 (column :) <$> columnsParser (size - fromIntegral consumedSize)
 
+indexPayloadParser :: BG.Get IndexPayload
+indexPayloadParser = do
+    [key, rowId] <- recordParser
+    pure $ IndexPayload key rowId
+
 data ObjectType = TableObject | IndexObject | ViewObject | TriggerObject
     deriving (Show)
 
@@ -352,24 +356,6 @@ data ObjectScema = ObjectScema
     }
     deriving (Show)
 
-objectSchemaParser :: BG.Get ObjectScema
-objectSchemaParser = do
-    [ StringRecord typ
-        , StringRecord name
-        , StringRecord tblName
-        , rootPage
-        , StringRecord sql
-        ] <-
-        recordParser
-    pure $
-        ObjectScema
-            { _objectType = textToObjectType typ
-            , _objectName = name
-            , _objectTblName = tblName
-            , _objectRootPage = getIntegerValue rootPage
-            , _objectSql = sql
-            }
-
 pageParser :: Word16 -> BG.Get (PageHeader, [PageCell])
 pageParser offset = do
     (header, headerSize) <- pageHeaderParser
@@ -388,7 +374,7 @@ schemaTableParser offset = do
                         [ StringRecord typ
                             , StringRecord name
                             , StringRecord tblName
-                            , rootPage
+                            , NumericRecord rootPage
                             , StringRecord sql
                             ]
                     } ->
@@ -397,7 +383,7 @@ schemaTableParser offset = do
                                 { _objectType = textToObjectType typ
                                 , _objectName = name
                                 , _objectTblName = tblName
-                                , _objectRootPage = getIntegerValue rootPage
+                                , _objectRootPage = rootPage
                                 , _objectSql = sql
                                 }
                 _ -> Nothing
@@ -482,11 +468,18 @@ main = do
                             columnNames
                             ( \values ->
                                 case whereCond of
-                                    Just (Sql.BinOp (Sql.Iden [Sql.Name _ name]) [Sql.Name _ "="] (Sql.StringLit "'" "'" s)) ->
-                                        case lookup (T.fromStrict name) values of
-                                            Just (StringRecord valStr) ->
-                                                T.fromStrict s == valStr
-                                            _ -> False
+                                    Just (Sql.BinOp (Sql.Iden [Sql.Name _ name]) [Sql.Name _ "="] left) ->
+                                        case left of
+                                            (Sql.StringLit _ _ s) ->
+                                                case lookup (T.fromStrict name) values of
+                                                    Just (StringRecord valStr) ->
+                                                        T.fromStrict s == valStr
+                                                    _ -> False
+                                            (Sql.NumLit n) ->
+                                                case lookup (T.fromStrict name) values of
+                                                    Just (NumericRecord valNum) ->
+                                                        read (T.unpack $ T.fromStrict n) == traceS "valNum" valNum
+                                                    _ -> False
                                     Just _ -> error "unsupport"
                                     Nothing -> True
                             )
@@ -524,7 +517,7 @@ selectColumns dbFilePath pageSize table tableName columnNames pred = do
                             Just $ T.fromStrict name
                         _ -> Nothing
                     )
-                    columns
+                    $ traceS "columns" columns
             Left err ->
                 []
 
@@ -567,6 +560,6 @@ mmapDbPage path pageSize pageIndex parser = do
                 fptr <- newForeignPtr_ (castPtr ptr :: Ptr Word8)
                 let bs = BS.fromForeignPtr fptr 0 (fromIntegral size)
                 let res = parse bs
-                print res
+                print $ last $ show res
                 pure res
             )
