@@ -11,8 +11,8 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.Graph (Table)
 import Data.Int (Int64)
-import Data.List (elemIndex, findIndex, findIndices, intercalate)
-import Data.Maybe (mapMaybe)
+import Data.List (elemIndex, find, findIndex, findIndices, intercalate)
+import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text.Lazy (Text)
 import Data.Text.Lazy qualified as T
 import Data.Text.Lazy.Encoding (decodeLatin1)
@@ -404,40 +404,66 @@ isTable :: ObjectScema -> Bool
 isTable ObjectScema{_objectType = TableObject} = True
 isTable _ = False
 
+readDbHeader :: FilePath -> IO DatabaseHeader
+readDbHeader dbFilePath = do
+    content <- BL.readFile dbFilePath
+    pure $ BG.runGet databaseHeaderParser content
+
+readFirstDbPage :: FilePath -> Word16 -> IO [ObjectScema]
+readFirstDbPage dbFilePath pageSize = do
+    firstPage <- mmapDbPage dbFilePath pageSize 1
+    pure $ BG.runGet (schemaTableParser 100) (BL.drop 100 firstPage)
+
+findTable :: FilePath -> Word16 -> Text -> IO ObjectScema
+findTable dbFilePath pageSize tableName = do
+    schemas <- readFirstDbPage dbFilePath pageSize
+    case find (\obj -> isTable obj && _objectTblName obj == tableName) schemas of
+        Just table -> pure table
+        _ -> fail $ "table \"" <> T.unpack tableName <> "\" not found"
+
+scanTable :: FilePath -> Word16 -> ObjectScema -> IO [PageCell]
+scanTable dbFilePath pageSize table = do
+    go (_objectRootPage table)
+  where
+    go :: Word64 -> IO [PageCell]
+    go pageNumber = do
+        pageBS <- mmapDbPage dbFilePath pageSize (traceS "pageNumber" pageNumber)
+        let (pageHeader, cells) = BG.runGet (pageParser 0) pageBS
+        case traceShow (_pageType pageHeader) (_pageType pageHeader) of
+            TableInteriorPage ->
+                concat
+                    <$> mapM
+                        ( \case
+                            TableInteriorCell leftChildPageNumber _ ->
+                                go $ fromIntegral leftChildPageNumber
+                            _ -> pure []
+                        )
+                        cells
+            TableLeafPage -> do
+                print $ "cells: " <> show cells
+                pure cells
+
 main :: IO ()
 main = do
     (dbFilePath : cmd : _) <- getArgs
+    dbHeader <- readDbHeader dbFilePath
+    let pageSize = _dbPageSize dbHeader
     case cmd of
         ".dbinfo" -> do
-            content <- BL.readFile dbFilePath
-            let (dbHeader, schemas) =
-                    BG.runGet
-                        ( do
-                            dbHeader <- databaseHeaderParser
-                            schemas <- schemaTableParser 100
-                            pure (dbHeader, schemas)
-                        )
-                        content
-            print $ "database page size: " <> show (_dbPageSize dbHeader)
+            schemas <- readFirstDbPage dbFilePath pageSize
+            print $ "database page size: " <> show pageSize
             print $ "number of tables: " <> show (length $ filter isTable schemas)
             pure ()
         ".tables" -> do
-            content <- BL.readFile dbFilePath
-            let (dbHeader, schemas) =
-                    BG.runGet
-                        ( do
-                            dbHeader <- databaseHeaderParser
-                            schemas <- schemaTableParser 100
-                            pure (dbHeader, schemas)
-                        )
-                        content
+            schemas <- readFirstDbPage dbFilePath pageSize
             let names = _objectTblName <$> filter isTable schemas
             IO.putStr $ T.unwords names
         sql -> do
             let expr = Sql.parseQueryExpr sqlDialet "" Nothing $ T.toStrict $ T.pack sql
             case expr of
                 Right Sql.Select{qeSelectList = [(Sql.App [Sql.Name _ "count"] _, _)], qeFrom = [Sql.TRSimple [Sql.Name _ tableName]]} -> do
-                    n <- selectCountStar dbFilePath (T.fromStrict tableName)
+                    table <- findTable dbFilePath pageSize (T.fromStrict tableName)
+                    n <- selectCountStar dbFilePath pageSize table
                     print n
                 Right
                     Sql.Select
@@ -446,8 +472,11 @@ main = do
                         , qeWhere = whereCond
                         } -> do
                         let columnNames = (\(Sql.Iden [Sql.Name _ columnName], _) -> T.fromStrict columnName) <$> idens
+                        table <- findTable dbFilePath pageSize (T.fromStrict tableName)
                         selectColumns
                             dbFilePath
+                            pageSize
+                            table
                             (T.fromStrict tableName)
                             columnNames
                             ( \values ->
@@ -455,7 +484,7 @@ main = do
                                     Just (Sql.BinOp (Sql.Iden [Sql.Name _ name]) [Sql.Name _ "="] (Sql.StringLit "'" "'" s)) ->
                                         case lookup (T.fromStrict name) values of
                                             Just (StringRecord valStr) ->
-                                                T.fromStrict s == valStr
+                                                T.fromStrict (traceS "compare" s) == valStr
                                             _ -> False
                                     Just _ -> error "unsupport"
                                     Nothing -> True
@@ -468,23 +497,12 @@ sqlDialet :: Dialect
 sqlDialet =
     ansi2011{diAutoincrement = True}
 
-selectColumns :: FilePath -> Text -> [Text] -> ([(Text, TableRecordValue)] -> Bool) -> IO ()
-selectColumns dbFilePath tableName columnNames pred = do
-    content <- BL.readFile dbFilePath
-    let (pageSize, table) =
-            BG.runGet
-                ( do
-                    dbHeader <- databaseHeaderParser
-                    schemas <- schemaTableParser 100
-                    case filter (\obj -> isTable obj && _objectTblName obj == tableName) schemas of
-                        [table] -> pure (_dbPageSize dbHeader, table)
-                        _ -> fail $ "table \"" <> T.unpack tableName <> "\" not found"
-                )
-                content
-    pageBS <- mmapDbPage dbFilePath pageSize $ _objectRootPage table
-    let (_, cells) = BG.runGet (pageParser 0) pageBS
+selectColumns :: FilePath -> Word16 -> ObjectScema -> Text -> [Text] -> ([(Text, TableRecordValue)] -> Bool) -> IO ()
+selectColumns dbFilePath pageSize table tableName columnNames pred = do
+    cells <- scanTable dbFilePath pageSize table
     let schemaColumnNames = getSchemaColumnNames (_objectSql table)
     let columnIndexes = mapMaybe (`elemIndex` schemaColumnNames) columnNames
+    print columnIndexes
     mapM_
         ( \case
             TableLeafCell cell payload ->
@@ -494,7 +512,7 @@ selectColumns dbFilePath tableName columnNames pred = do
                             fmap (\i -> show $ payload !! i) columnIndexes
                 )
         )
-        cells
+        (traceS "scan cells" cells)
   where
     getSchemaColumnNames :: Text -> [Text]
     getSchemaColumnNames sql =
@@ -510,19 +528,8 @@ selectColumns dbFilePath tableName columnNames pred = do
             Left err ->
                 []
 
-selectCountStar :: FilePath -> Text -> IO Int
-selectCountStar dbFilePath tableName = do
-    content <- BL.readFile dbFilePath
-    let (pageSize, table) =
-            BG.runGet
-                ( do
-                    dbHeader <- databaseHeaderParser
-                    schemas <- schemaTableParser 100
-                    case filter (\obj -> isTable obj && _objectTblName obj == tableName) schemas of
-                        [table] -> pure (_dbPageSize dbHeader, table)
-                        _ -> fail $ "table \"" <> T.unpack tableName <> "\" not found"
-                )
-                content
+selectCountStar :: FilePath -> Word16 -> ObjectScema -> IO Int
+selectCountStar dbFilePath pageSize table = do
     pageBS <- mmapDbPage dbFilePath pageSize $ _objectRootPage table
     let (_, cells) = BG.runGet (pageParser 0) pageBS
     pure $ length cells

@@ -1,5 +1,15 @@
 [
   {
+    "slug": "table_scan",
+    "tester_log_prefix": "stage-8",
+    "title": "Stage #8: Retrieve data using a full-table scan"
+  },
+  {
+    "slug": "index_scan",
+    "tester_log_prefix": "stage-9",
+    "title": "Stage #9: Retrieve data using an index"
+  },
+  {
     "slug": "read_multiple_columns",
     "tester_log_prefix": "stage-6",
     "title": "Stage #6: Read data from multiple columns"
@@ -33,15 +43,5 @@
     "slug": "where",
     "tester_log_prefix": "stage-7",
     "title": "Stage #7: Filter data with a WHERE clause"
-  },
-  {
-    "slug": "table_scan",
-    "tester_log_prefix": "stage-8",
-    "title": "Stage #8: Retrieve data using a full-table scan"
-  },
-  {
-    "slug": "index_scan",
-    "tester_log_prefix": "stage-9",
-    "title": "Stage #9: Retrieve data using an index"
   }
 ]
