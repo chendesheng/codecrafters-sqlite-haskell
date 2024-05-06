@@ -8,6 +8,7 @@ import Data.Binary (Binary (get), Word16, Word32, Word64, Word8)
 import Data.Binary.Get qualified as BG
 import Data.Bits (Bits (shiftL, (.&.), (.|.)))
 import Data.ByteString qualified as BS
+import Data.ByteString.Internal qualified as BS (fromForeignPtr)
 import Data.ByteString.Lazy qualified as BL
 import Data.Graph (Table)
 import Data.Int (Int64)
@@ -18,13 +19,17 @@ import Data.Text.Lazy qualified as T
 import Data.Text.Lazy.Encoding (decodeLatin1)
 import Data.Text.Lazy.IO qualified as IO
 import Debug.Trace (trace, traceShow)
+import Foreign (Ptr)
+import Foreign.ForeignPtr (newForeignPtr_)
+import Foreign.Ptr (castPtr)
 import Language.SQL.SimpleSQL.Dialect (Dialect (diAutoincrement), ansi2011)
 import Language.SQL.SimpleSQL.Parse qualified as Sql
 import Language.SQL.SimpleSQL.Syntax (QueryExpr (..))
 import Language.SQL.SimpleSQL.Syntax qualified as Sql
 import Numeric (showHex)
 import System.Environment (getArgs)
-import System.IO.MMap (mmapFileByteStringLazy)
+import System.IO.MMap (mmapFileByteStringLazy, mmapFileForeignPtr, mmapWithFilePtr, munmapFilePtr)
+import System.IO.MMap qualified as MMap
 
 traceS :: (Show a) => String -> a -> a
 traceS prefix x = trace (prefix <> ": " <> show x) x
@@ -411,8 +416,7 @@ readDbHeader dbFilePath = do
 
 readFirstDbPage :: FilePath -> Word16 -> IO [ObjectScema]
 readFirstDbPage dbFilePath pageSize = do
-    firstPage <- mmapDbPage dbFilePath pageSize 1
-    pure $ BG.runGet (schemaTableParser 100) (BL.drop 100 firstPage)
+    mmapDbPage dbFilePath pageSize 1 (schemaTableParser 100)
 
 findTable :: FilePath -> Word16 -> Text -> IO ObjectScema
 findTable dbFilePath pageSize tableName = do
@@ -427,9 +431,8 @@ scanTable dbFilePath pageSize table = do
   where
     go :: Word64 -> IO [PageCell]
     go pageNumber = do
-        pageBS <- mmapDbPage dbFilePath pageSize (traceS "pageNumber" pageNumber)
-        let (pageHeader, cells) = BG.runGet (pageParser 0) pageBS
-        case traceShow (_pageType pageHeader) (_pageType pageHeader) of
+        (pageHeader, cells) <- mmapDbPage dbFilePath pageSize pageNumber (pageParser 0)
+        case _pageType pageHeader of
             TableInteriorPage ->
                 concat
                     <$> mapM
@@ -439,8 +442,7 @@ scanTable dbFilePath pageSize table = do
                             _ -> pure []
                         )
                         cells
-            TableLeafPage -> do
-                print $ "cells: " <> show cells
+            TableLeafPage ->
                 pure cells
 
 main :: IO ()
@@ -484,7 +486,7 @@ main = do
                                     Just (Sql.BinOp (Sql.Iden [Sql.Name _ name]) [Sql.Name _ "="] (Sql.StringLit "'" "'" s)) ->
                                         case lookup (T.fromStrict name) values of
                                             Just (StringRecord valStr) ->
-                                                T.fromStrict (traceS "compare" s) == valStr
+                                                T.fromStrict s == valStr
                                             _ -> False
                                     Just _ -> error "unsupport"
                                     Nothing -> True
@@ -502,7 +504,6 @@ selectColumns dbFilePath pageSize table tableName columnNames pred = do
     cells <- scanTable dbFilePath pageSize table
     let schemaColumnNames = getSchemaColumnNames (_objectSql table)
     let columnIndexes = mapMaybe (`elemIndex` schemaColumnNames) columnNames
-    print columnIndexes
     mapM_
         ( \case
             TableLeafCell cell payload ->
@@ -512,7 +513,7 @@ selectColumns dbFilePath pageSize table tableName columnNames pred = do
                             fmap (\i -> show $ payload !! i) columnIndexes
                 )
         )
-        (traceS "scan cells" cells)
+        cells
   where
     getSchemaColumnNames :: Text -> [Text]
     getSchemaColumnNames sql =
@@ -530,16 +531,43 @@ selectColumns dbFilePath pageSize table tableName columnNames pred = do
 
 selectCountStar :: FilePath -> Word16 -> ObjectScema -> IO Int
 selectCountStar dbFilePath pageSize table = do
-    pageBS <- mmapDbPage dbFilePath pageSize $ _objectRootPage table
-    let (_, cells) = BG.runGet (pageParser 0) pageBS
+    (_, cells) <- mmapDbPage dbFilePath pageSize (_objectRootPage table) (pageParser 0)
     pure $ length cells
 
-mmapDbPage :: FilePath -> Word16 -> Word64 -> IO BL.ByteString
-mmapDbPage path pageSize pageIndex =
-    mmapFileByteStringLazy
+mmapDbPage :: (Show a) => FilePath -> Word16 -> Word64 -> BG.Get a -> IO a
+mmapDbPage path pageSize pageIndex parser = do
+    mmapFileByteString
         path
-        ( Just
-            ( fromIntegral pageSize * fromIntegral (pageIndex - 1)
-            , fromIntegral pageSize
-            )
+        ( Just $
+            if pageIndex == 1
+                then (100, fromIntegral pageSize - 100)
+                else
+                    ( fromIntegral pageSize * fromIntegral (pageIndex - 1)
+                    , fromIntegral pageSize
+                    )
         )
+        (BG.runGet parser . BL.fromStrict)
+  where
+    -- \| Maps region of file and returns it as 'BS.ByteString'.  File is
+    -- mapped in in 'ReadOnly' mode. See 'mmapFilePtr' for details.
+    mmapFileByteString ::
+        (Show a) =>
+        FilePath ->
+        -- \^ name of file to map
+        Maybe (Int64, Int) ->
+        -- \^ range to map, maps whole file if Nothing
+        (BS.ByteString -> a) ->
+        IO a
+    -- \^ bytestring with file contents
+    mmapFileByteString filepath range parse = do
+        mmapWithFilePtr
+            filepath
+            MMap.ReadOnly
+            range
+            ( \(ptr, size) -> do
+                fptr <- newForeignPtr_ (castPtr ptr :: Ptr Word8)
+                let bs = BS.fromForeignPtr fptr 0 (fromIntegral size)
+                let res = parse bs
+                print res
+                pure res
+            )
