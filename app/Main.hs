@@ -239,14 +239,13 @@ pageCellsParser :: Word16 -> PageHeader -> BG.Get [PageCell]
 pageCellsParser offset (PageHeader{_pageType = pageType, _numberOfCells = n, _cellContentAreaStartOffset = contentStartOffset}) = do
     cellPointers <- mapM (const BG.getWord16be) [0 .. n - 1]
     BG.skip $ fromIntegral $ contentStartOffset - (offset + n * 2)
-    cellContent <- BG.getRemainingLazyByteString
-    pure
-        ( ( \pointer ->
-                let bs = BL.drop (fromIntegral $ pointer - contentStartOffset) cellContent
-                 in BG.runGet (pageCellParser pageType) bs
-          )
-            <$> cellPointers
+    mapM
+        ( \pointer ->
+            BG.lookAhead $ do
+                BG.skip $ fromIntegral $ pointer - contentStartOffset
+                pageCellParser pageType
         )
+        cellPointers
 
 type TableRecord = [TableRecordValue]
 
