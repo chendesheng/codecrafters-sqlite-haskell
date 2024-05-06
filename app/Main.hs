@@ -195,6 +195,8 @@ type CellPointer = Word16
 
 >>> BG.runGet variantParserWithSize $ BL.pack [0x81, 0x80, 0x00]
 (16384,3)
+>>> BG.runGet variantParserWithSize $ BL.pack [0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00]
+(144115188075856000,9)
 -}
 variantParserWithSize :: BG.Get (Word64, Word8)
 variantParserWithSize = do
@@ -226,6 +228,7 @@ pageCellParser :: PageType -> BG.Get PageCell
 pageCellParser pageType = do
     case pageType of
         TableLeafPage -> do
+            -- looks like we don't need payload size becuase we not handling overflow
             payloadSize <- variantParser
             rowId <- signedVariantParser
             TableLeafCell rowId <$> recordParser
@@ -242,13 +245,12 @@ pageCellParser pageType = do
             IndexInteriorCell leftChildPageNumber <$> indexPayloadParser
 
 pageCellsParser :: Word16 -> PageHeader -> BG.Get [PageCell]
-pageCellsParser offset (PageHeader{_pageType = pageType, _numberOfCells = n, _cellContentAreaStartOffset = contentStartOffset}) = do
-    cellPointers <- mapM (const BG.getWord16be) [0 .. n - 1]
-    BG.skip $ fromIntegral $ contentStartOffset - (offset + n * 2)
+pageCellsParser offset (PageHeader{_pageType = pageType, _numberOfCells = n}) = do
+    cellPointers <- BG.lookAhead $ mapM (const BG.getWord16be) [0 .. n - 1]
     mapM
         ( \pointer ->
             BG.lookAhead $ do
-                BG.skip $ fromIntegral $ pointer - contentStartOffset
+                BG.skip $ fromIntegral $ pointer - offset
                 pageCellParser pageType
         )
         cellPointers
@@ -257,12 +259,6 @@ type TableRecord = [TableRecordValue]
 
 data TableRecordValue
     = NullRecord
-    -- | Int8Record Word8
-    -- | Int16Record Word16
-    -- | Int24Record Word32
-    -- | Int32Record Word32
-    -- | Int48Record Word64
-    -- | Int64Record Word64
     | NumericRecord Word64
     | Float64Record Double
     | ZeroRecord
@@ -290,7 +286,7 @@ recordParser = do
   where
     valueParser :: Word64 -> BG.Get TableRecordValue
     valueParser typ = do
-        case traceS "type" typ of
+        case typ of
             0 -> pure NullRecord
             1 -> NumericRecord . fromIntegral <$> BG.getWord8
             2 -> NumericRecord . fromIntegral <$> BG.getWord16be
@@ -363,9 +359,9 @@ pageParser offset = do
     cells <- pageCellsParser (offset + headerSize) header
     pure (header, cells)
 
-schemaTableParser :: Word16 -> BG.Get [ObjectScema]
-schemaTableParser offset = do
-    (_, cells) <- pageParser offset
+schemaTableParser :: BG.Get [ObjectScema]
+schemaTableParser = do
+    (_, cells) <- pageParser 100
     pure $
         mapMaybe
             ( \case
@@ -399,16 +395,13 @@ readDbHeader dbFilePath = do
     content <- BL.readFile dbFilePath
     pure $ BG.runGet databaseHeaderParser content
 
-readFirstDbPage :: FilePath -> Word16 -> IO [ObjectScema]
-readFirstDbPage dbFilePath pageSize = do
-    mmapDbPage dbFilePath pageSize 1 (schemaTableParser 100)
-
 findTable :: FilePath -> Word16 -> Text -> IO ObjectScema
-findTable dbFilePath pageSize tableName = do
-    schemas <- readFirstDbPage dbFilePath pageSize
-    case find (\obj -> isTable obj && _objectTblName obj == tableName) schemas of
-        Just table -> pure table
-        _ -> fail $ "table \"" <> T.unpack tableName <> "\" not found"
+findTable dbFilePath pageSize tableName =
+    mmapDbPage dbFilePath pageSize 1 $ do
+        tables <- filter isTable <$> schemaTableParser
+        case find (\obj -> _objectTblName obj == tableName) tables of
+            Just table -> pure table
+            _ -> fail $ "table \"" <> T.unpack tableName <> "\" not found"
 
 scanTable :: FilePath -> Word16 -> ObjectScema -> IO [PageCell]
 scanTable dbFilePath pageSize table = do
@@ -437,13 +430,15 @@ main = do
     let pageSize = _dbPageSize dbHeader
     case cmd of
         ".dbinfo" -> do
-            schemas <- readFirstDbPage dbFilePath pageSize
             print $ "database page size: " <> show pageSize
-            print $ "number of tables: " <> show (length $ filter isTable schemas)
+            count <- mmapDbPage dbFilePath pageSize 1 $ do
+                length . filter isTable <$> schemaTableParser
+            print $ "number of tables: " <> show count
             pure ()
         ".tables" -> do
-            schemas <- readFirstDbPage dbFilePath pageSize
-            let names = _objectTblName <$> filter isTable schemas
+            names <- mmapDbPage dbFilePath pageSize 1 $ do
+                tables <- filter isTable <$> schemaTableParser
+                pure $ fmap _objectTblName tables
             IO.putStr $ T.unwords names
         sql -> do
             let expr = Sql.parseQueryExpr sqlDialet "" Nothing $ T.toStrict $ T.pack sql
@@ -478,7 +473,7 @@ main = do
                                             (Sql.NumLit n) ->
                                                 case lookup (T.fromStrict name) values of
                                                     Just (NumericRecord valNum) ->
-                                                        read (T.unpack $ T.fromStrict n) == traceS "valNum" valNum
+                                                        read (T.unpack $ T.fromStrict n) == valNum
                                                     _ -> False
                                     Just _ -> error "unsupport"
                                     Nothing -> True
@@ -502,7 +497,7 @@ selectColumns dbFilePath pageSize table tableName columnNames pred = do
                 ( when (pred (zip schemaColumnNames payload)) $
                     putStrLn $
                         intercalate "|" $
-                            fmap (\i -> show $ payload !! i) columnIndexes
+                            fmap (\i -> show $ traceS "column payload" payload !! i) columnIndexes
                 )
         )
         cells
@@ -560,6 +555,6 @@ mmapDbPage path pageSize pageIndex parser = do
                 fptr <- newForeignPtr_ (castPtr ptr :: Ptr Word8)
                 let bs = BS.fromForeignPtr fptr 0 (fromIntegral size)
                 let res = parse bs
-                print $ last $ show res
+                putStr $ show $ last $ show res
                 pure res
             )
