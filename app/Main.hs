@@ -3,7 +3,7 @@
 
 module Main (main) where
 
-import Control.Monad (when)
+import Control.Monad (when, forM_)
 import Data.Binary (Binary (get), Word16, Word32, Word64, Word8)
 import Data.Binary.Get qualified as BG
 import Data.Bits (Bits (shiftL, (.&.), (.|.)))
@@ -13,7 +13,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Graph (Table)
 import Data.Int (Int64)
 import Data.List (elemIndex, find, findIndex, findIndices, intercalate)
-import Data.Maybe (listToMaybe, mapMaybe)
+import Data.Maybe (listToMaybe, mapMaybe, fromJust)
 import Data.Text.Lazy (Text)
 import Data.Text.Lazy qualified as T
 import Data.Text.Lazy.Encoding (decodeLatin1)
@@ -224,7 +224,7 @@ signedVariantParser = fromIntegral . fst <$> variantParserWithSize
 
 pageCellParser :: PageType -> BG.Get PageCell
 pageCellParser pageType = do
-    case traceS "pageType" pageType of
+    case pageType of
         TableLeafPage -> do
             -- looks like we don't need payload size becuase we not handling overflow
             payloadSize <- variantParser
@@ -249,10 +249,10 @@ pageCellsParser offset (PageHeader{_pageType = pageType, _numberOfCells = n}) = 
     mapM
         ( \pointer ->
             BG.lookAhead $ do
-                BG.skip $ fromIntegral $ pointer - (traceS "offset" offset)
+                BG.skip $ fromIntegral $ pointer - offset
                 pageCellParser pageType
         )
-        (traceS "pointers" cellPointers)
+        cellPointers
 
 type TableRecord = [TableRecordValue]
 
@@ -359,7 +359,7 @@ pageParser :: Word16 -> BG.Get (PageHeader, [PageCell])
 pageParser offset = do
     (header, headerSize) <- pageHeaderParser
     -- assume page header is always 8 bytes
-    cells <- pageCellsParser (offset + headerSize) (traceS "header" header)
+    cells <- pageCellsParser (offset + headerSize) header
     pure (header, cells)
 
 schemaTableParser :: BG.Get [ObjectScema]
@@ -466,7 +466,7 @@ main = do
                         table <- findTable dbFilePath pageSize (T.fromStrict tableName)
                         case whereCond of
                             Just (Sql.BinOp (Sql.Iden [Sql.Name _ "id"]) [Sql.Name _ "="] (Sql.NumLit n)) ->
-                                selectByRowId dbFilePath pageSize table (read $ T.unpack $ T.fromStrict n) columnNames
+                                selectByRowId dbFilePath pageSize table columnNames (read $ T.unpack $ T.fromStrict n) 
                             Just (Sql.BinOp (Sql.Iden [Sql.Name _ name]) [Sql.Name _ "="] equalTo) ->
                                 let equalTo' =
                                         case equalTo of
@@ -491,9 +491,9 @@ sqlDialet :: Dialect
 sqlDialet =
     ansi2011{diAutoincrement = True}
 
-selectByRowId :: FilePath -> Word16 -> ObjectScema -> RowId -> [Text] -> IO ()
-selectByRowId dbFilePath pageSize table rowId columnNames = do
-    values <- go (traceS "rowId" rowId) (_objectRootPage table)
+selectByRowId :: FilePath -> Word16 -> ObjectScema ->  [Text] -> RowId -> IO ()
+selectByRowId dbFilePath pageSize table columnNames rowId = do
+    values <- go rowId (_objectRootPage table)
     case values of
         Just values -> do
             let schemaColumnNames = getSchemaColumnNames (_objectSql table)
@@ -518,8 +518,9 @@ selectColumns :: FilePath -> Word16 -> ObjectScema -> Text -> [Text] -> Text -> 
 selectColumns dbFilePath pageSize table tableName columnNames name equalTo = do
     foundIndexObject <- findIndexObject dbFilePath pageSize tableName name
     case foundIndexObject of
-        Just indexObject ->
-            selectByIndex dbFilePath pageSize table (traceS "indexObject" indexObject) name equalTo
+        Just indexObject -> do
+            rowIds <- selectByIndex equalTo (_objectRootPage indexObject)
+            forM_ rowIds $ selectByRowId dbFilePath pageSize table columnNames
         _ -> do
             cells <- scanTable dbFilePath pageSize table
             let schemaColumnNames = getSchemaColumnNames (_objectSql table)
@@ -533,30 +534,17 @@ selectColumns dbFilePath pageSize table tableName columnNames name equalTo = do
                 )
                 cells
   where
-    hasIndex :: ObjectScema -> Text -> Bool
-    hasIndex = undefined
-
-    selectByIndex :: FilePath -> Word16 -> ObjectScema -> ObjectScema -> Text -> TableRecordValue -> IO ()
-    selectByIndex dbFilePath pageSize table indexObject columnName equalTo = do
-        rowId <- go equalTo (_objectRootPage indexObject)
-        case rowId of
-            Just rowId -> do
-                selectByRowId dbFilePath pageSize table rowId []
-            Nothing -> putStrLn "not found"
-      where
-        go :: TableRecordValue -> Word64 -> IO (Maybe RowId)
-        go indexKey pageNumber = do
-            (pageHeader, cells) <- mmapDbPage dbFilePath pageSize pageNumber (pageParser 0)
-            -- FIXME: use binary search
-            case dropWhile (\c -> head (_recordValues c) < indexKey) cells of
-                (IndexInteriorCell leftChildPageNumber rid [key]) : _ ->
-                    go indexKey $ fromIntegral leftChildPageNumber
-                (IndexLeafCell rid [key]) : _ ->
-                    if key == indexKey
-                        then pure $ Just rid
-                        else pure Nothing
-                _ -> pure Nothing
-
+    selectByIndex :: TableRecordValue -> Word64 -> IO [RowId]
+    selectByIndex indexKey pageNumber = do
+        (pageHeader, cells) <- mmapDbPage dbFilePath pageSize pageNumber (pageParser 0)
+        case dropWhile (\c -> head (_recordValues c) < indexKey) cells of
+            (IndexInteriorCell leftChildPageNumber rid [key]) : _ ->
+                selectByIndex indexKey $ fromIntegral leftChildPageNumber
+            cs@((IndexLeafCell rid _) : _) ->
+                pure $ map _rowId $ takeWhile (\c -> head (_recordValues c) == indexKey) cs
+            [] ->do
+                selectByIndex indexKey $ fromIntegral $ fromJust $ _rightmostPointer pageHeader
+    
     pred :: ([(Text, TableRecordValue)] -> Bool)
     pred values =
         case lookup name values of
