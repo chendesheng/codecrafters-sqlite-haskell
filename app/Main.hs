@@ -3,7 +3,7 @@
 
 module Main (main) where
 
-import Control.Monad (when, forM_)
+import Control.Monad (forM_, when)
 import Data.Binary (Binary (get), Word16, Word32, Word64, Word8)
 import Data.Binary.Get qualified as BG
 import Data.Bits (Bits (shiftL, (.&.), (.|.)))
@@ -13,7 +13,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Graph (Table)
 import Data.Int (Int64)
 import Data.List (elemIndex, find, findIndex, findIndices, intercalate)
-import Data.Maybe (listToMaybe, mapMaybe, fromJust)
+import Data.Maybe (fromJust, listToMaybe, mapMaybe)
 import Data.Text.Lazy (Text)
 import Data.Text.Lazy qualified as T
 import Data.Text.Lazy.Encoding (decodeLatin1)
@@ -226,7 +226,7 @@ pageCellParser :: PageType -> BG.Get PageCell
 pageCellParser pageType = do
     case pageType of
         TableLeafPage -> do
-            -- looks like we don't need payload size becuase we not handling overflow
+            -- looks like we don't need payload size because we not handling overflow
             payloadSize <- variantParser
             rowId <- signedVariantParser
             TableLeafCell rowId <$> recordParser
@@ -267,6 +267,8 @@ data TableRecordValue
 
 instance Ord TableRecordValue where
     compare :: TableRecordValue -> TableRecordValue -> Ordering
+    compare NullRecord _ = LT
+    compare _ NullRecord = GT
     compare (NumericRecord a) (NumericRecord b) = compare a b
     compare (Float64Record a) (Float64Record b) = compare a b
     compare (StringRecord a) (StringRecord b) = compare a b
@@ -284,7 +286,7 @@ instance Show TableRecordValue where
 recordParser :: BG.Get TableRecord
 recordParser = do
     (headerSize, consumedSize) <- variantParserWithSize
-    columns <- columnsParser (headerSize - fromIntegral consumedSize)
+    columns <- recordHeaderParser (headerSize - fromIntegral consumedSize)
     mapM valueParser columns
   where
     valueParser :: Word64 -> BG.Get TableRecordValue
@@ -323,18 +325,18 @@ recordParser = do
         b <- BG.getWord16be
         pure $ (fromIntegral a `shiftL` 16) .|. fromIntegral b
 
-    columnsParser :: Word64 -> BG.Get [Word64]
-    columnsParser size =
+    recordHeaderParser :: Word64 -> BG.Get [Word64]
+    recordHeaderParser size =
         if size == 0
             then pure []
             else do
                 (column, consumedSize) <- variantParserWithSize
-                (column :) <$> columnsParser (size - fromIntegral consumedSize)
+                (column :) <$> recordHeaderParser (size - fromIntegral consumedSize)
 
 indexPayloadParser :: BG.Get (TableRecord, RowId)
 indexPayloadParser = do
-    [key, NumericRecord rowId] <- recordParser
-    pure ([key], fromIntegral rowId)
+    [indexValue, NumericRecord rowId] <- recordParser
+    pure ([indexValue], fromIntegral rowId)
 
 data ObjectType = TableObject | IndexObject | ViewObject | TriggerObject
     deriving (Show, Eq)
@@ -466,7 +468,7 @@ main = do
                         table <- findTable dbFilePath pageSize (T.fromStrict tableName)
                         case whereCond of
                             Just (Sql.BinOp (Sql.Iden [Sql.Name _ "id"]) [Sql.Name _ "="] (Sql.NumLit n)) ->
-                                selectByRowId dbFilePath pageSize table columnNames (read $ T.unpack $ T.fromStrict n) 
+                                selectByRowId dbFilePath pageSize table columnNames (read $ T.unpack $ T.fromStrict n)
                             Just (Sql.BinOp (Sql.Iden [Sql.Name _ name]) [Sql.Name _ "="] equalTo) ->
                                 let equalTo' =
                                         case equalTo of
@@ -480,9 +482,9 @@ main = do
                                         table
                                         (T.fromStrict tableName)
                                         columnNames
-                                        (T.fromStrict name)
-                                        equalTo'
-                            _ -> error "not support"
+                                        (Just (T.fromStrict name, equalTo'))
+                            Just _ -> error "not support"
+                            Nothing -> selectColumns dbFilePath pageSize table (T.fromStrict tableName) columnNames Nothing
                 Right x -> print x
                 x -> do
                     error "execute sql error"
@@ -491,7 +493,7 @@ sqlDialet :: Dialect
 sqlDialet =
     ansi2011{diAutoincrement = True}
 
-selectByRowId :: FilePath -> Word16 -> ObjectScema ->  [Text] -> RowId -> IO ()
+selectByRowId :: FilePath -> Word16 -> ObjectScema -> [Text] -> RowId -> IO ()
 selectByRowId dbFilePath pageSize table columnNames rowId = do
     values <- go rowId (_objectRootPage table)
     case values of
@@ -506,50 +508,51 @@ selectByRowId dbFilePath pageSize table columnNames rowId = do
         (pageHeader, cells) <- mmapDbPage dbFilePath pageSize pageNumber (pageParser 0)
         -- FIXME: use binary search
         case dropWhile (\c -> _rowId c < rowId) cells of
-            (TableInteriorCell leftChildPageNumber rid) : _ ->
+            (TableInteriorCell leftChildPageNumber _) : _ ->
                 go rowId $ fromIntegral leftChildPageNumber
             (TableLeafCell rid values) : _ ->
                 if rid == rowId
                     then pure $ Just values
                     else pure Nothing
+            [] -> go rowId $ fromIntegral $ fromJust $ _rightmostPointer pageHeader
             _ -> pure Nothing
 
-selectColumns :: FilePath -> Word16 -> ObjectScema -> Text -> [Text] -> Text -> TableRecordValue -> IO ()
-selectColumns dbFilePath pageSize table tableName columnNames name equalTo = do
-    foundIndexObject <- findIndexObject dbFilePath pageSize tableName name
-    case foundIndexObject of
-        Just indexObject -> do
-            rowIds <- selectByIndex equalTo (_objectRootPage indexObject)
-            forM_ rowIds $ selectByRowId dbFilePath pageSize table columnNames
-        _ -> do
-            cells <- scanTable dbFilePath pageSize table
-            let schemaColumnNames = getSchemaColumnNames (_objectSql table)
-            let columnIndexes = mapMaybe (`elemIndex` schemaColumnNames) columnNames
-            mapM_
-                ( \case
-                    TableLeafCell rowId payload ->
-                        ( when (pred (zip schemaColumnNames payload)) $
-                            printColumnValues columnIndexes rowId payload
-                        )
-                )
-                cells
+selectColumns :: FilePath -> Word16 -> ObjectScema -> Text -> [Text] -> Maybe (Text, TableRecordValue) -> IO ()
+selectColumns dbFilePath pageSize table tableName columnNames whereCond = do
+    case whereCond of
+        Just (name, equalTo) -> do
+            foundIndexObject <- findIndexObject dbFilePath pageSize tableName name
+            case foundIndexObject of
+                Just indexObject -> do
+                    rowIds <- selectByIndex equalTo $ _objectRootPage indexObject
+                    forM_ rowIds $ selectByRowId dbFilePath pageSize table columnNames
+                _ ->
+                    selectByScanTable (\values -> lookup name values == Just equalTo)
+        _ -> selectByScanTable $ const True
   where
+    selectByScanTable :: ([(Text, TableRecordValue)] -> Bool) -> IO ()
+    selectByScanTable pred = do
+        cells <- scanTable dbFilePath pageSize table
+        let schemaColumnNames = getSchemaColumnNames (_objectSql table)
+        let columnIndexes = mapMaybe (`elemIndex` schemaColumnNames) columnNames
+        mapM_
+            ( \case
+                TableLeafCell rowId payload ->
+                    ( when (pred (zip schemaColumnNames payload)) $
+                        printColumnValues columnIndexes rowId payload
+                    )
+            )
+            cells
+
     selectByIndex :: TableRecordValue -> Word64 -> IO [RowId]
-    selectByIndex indexKey pageNumber = do
+    selectByIndex indexValue pageNumber = do
         (pageHeader, cells) <- mmapDbPage dbFilePath pageSize pageNumber (pageParser 0)
-        case dropWhile (\c -> head (_recordValues c) < indexKey) cells of
-            (IndexInteriorCell leftChildPageNumber rid [key]) : _ ->
-                selectByIndex indexKey $ fromIntegral leftChildPageNumber
-            cs@((IndexLeafCell rid _) : _) ->
-                pure $ map _rowId $ takeWhile (\c -> head (_recordValues c) == indexKey) cs
-            [] ->do
-                selectByIndex indexKey $ fromIntegral $ fromJust $ _rightmostPointer pageHeader
-    
-    pred :: ([(Text, TableRecordValue)] -> Bool)
-    pred values =
-        case lookup name values of
-            Just val -> val == equalTo
-            _ -> False
+        case dropWhile (\c -> head (_recordValues c) < indexValue) cells of
+            (IndexInteriorCell leftChildPageNumber _ _) : _ ->
+                selectByIndex indexValue $ fromIntegral leftChildPageNumber
+            cs@((IndexLeafCell _ _) : _) ->
+                pure $ map _rowId $ takeWhile (\c -> head (_recordValues c) == indexValue) cs
+            [] -> selectByIndex indexValue $ fromIntegral $ fromJust $ _rightmostPointer pageHeader
 
 printColumnValues :: [Int] -> RowId -> [TableRecordValue] -> IO ()
 printColumnValues columnIndexes rowId payload =
