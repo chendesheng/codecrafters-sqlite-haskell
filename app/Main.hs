@@ -28,7 +28,7 @@ import Language.SQL.SimpleSQL.Syntax (QueryExpr (..))
 import Language.SQL.SimpleSQL.Syntax qualified as Sql
 import Numeric (showHex)
 import System.Environment (getArgs)
-import System.IO.MMap (mmapFileByteStringLazy, mmapFileForeignPtr, mmapWithFilePtr, munmapFilePtr)
+import System.IO.MMap (mmapFileByteString, mmapFileByteStringLazy, mmapFileForeignPtr, mmapWithFilePtr, munmapFilePtr)
 import System.IO.MMap qualified as MMap
 
 traceS :: (Show a) => String -> a -> a
@@ -164,12 +164,6 @@ type PageCellPayload = BL.ByteString
 
 type RowId = Int64
 
-data IndexPayload = IndexPayload
-    { _indexPayloadKey :: TableRecordValue -- only one column is supported
-    , _indexPayloadRowId :: TableRecordValue
-    }
-    deriving (Show)
-
 data PageCell
     = TableLeafCell
         { _rowId :: RowId
@@ -179,10 +173,14 @@ data PageCell
         { _leftChildPageNumber :: Word32
         , _rowId :: RowId
         }
-    | IndexLeafCell IndexPayload
+    | IndexLeafCell
+        { _rowId :: RowId
+        , _recordValues :: TableRecord
+        }
     | IndexInteriorCell
         { _leftChildPageNumber :: Word32
-        , _payload :: IndexPayload
+        , _rowId :: RowId
+        , _recordValues :: TableRecord
         }
     deriving (Show)
 
@@ -226,7 +224,7 @@ signedVariantParser = fromIntegral . fst <$> variantParserWithSize
 
 pageCellParser :: PageType -> BG.Get PageCell
 pageCellParser pageType = do
-    case pageType of
+    case traceS "pageType" pageType of
         TableLeafPage -> do
             -- looks like we don't need payload size becuase we not handling overflow
             payloadSize <- variantParser
@@ -237,12 +235,13 @@ pageCellParser pageType = do
             TableInteriorCell leftChildPageNumber <$> signedVariantParser
         IndexLeafPage -> do
             payloadSize <- variantParser
-            IndexLeafCell <$> indexPayloadParser
+            (values, rowId) <- indexPayloadParser
+            pure $ IndexLeafCell rowId values
         IndexInteriorPage -> do
             leftChildPageNumber <- BG.getWord32be
             payloadSize <- variantParser
-            payload <- BG.getLazyByteString $ fromIntegral payloadSize
-            IndexInteriorCell leftChildPageNumber <$> indexPayloadParser
+            (values, rowId) <- indexPayloadParser
+            pure $ IndexInteriorCell leftChildPageNumber rowId values
 
 pageCellsParser :: Word16 -> PageHeader -> BG.Get [PageCell]
 pageCellsParser offset (PageHeader{_pageType = pageType, _numberOfCells = n}) = do
@@ -250,10 +249,10 @@ pageCellsParser offset (PageHeader{_pageType = pageType, _numberOfCells = n}) = 
     mapM
         ( \pointer ->
             BG.lookAhead $ do
-                BG.skip $ fromIntegral $ pointer - offset
+                BG.skip $ fromIntegral $ pointer - (traceS "offset" offset)
                 pageCellParser pageType
         )
-        cellPointers
+        (traceS "pointers" cellPointers)
 
 type TableRecord = [TableRecordValue]
 
@@ -261,19 +260,23 @@ data TableRecordValue
     = NullRecord
     | NumericRecord Word64
     | Float64Record Double
-    | ZeroRecord
-    | OneRecord
     | InternalRecord
     | StringRecord Text
     | BlobRecord BL.ByteString
+    deriving (Eq)
+
+instance Ord TableRecordValue where
+    compare :: TableRecordValue -> TableRecordValue -> Ordering
+    compare (NumericRecord a) (NumericRecord b) = compare a b
+    compare (Float64Record a) (Float64Record b) = compare a b
+    compare (StringRecord a) (StringRecord b) = compare a b
+    compare (BlobRecord a) (BlobRecord b) = compare a b
 
 instance Show TableRecordValue where
     show :: TableRecordValue -> String
     show NullRecord = "NULL"
     show (StringRecord s) = T.unpack s
     show (Float64Record f) = show f
-    show ZeroRecord = "0"
-    show OneRecord = "1"
     show InternalRecord = ""
     show (BlobRecord _) = "<blob>"
     show (NumericRecord n) = show n
@@ -295,8 +298,8 @@ recordParser = do
             5 -> NumericRecord . fromIntegral <$> getWord48
             6 -> NumericRecord . fromIntegral <$> BG.getWord64be
             7 -> Float64Record <$> BG.getDoublebe
-            8 -> pure ZeroRecord
-            9 -> pure OneRecord
+            8 -> pure $ NumericRecord 0
+            9 -> pure $ NumericRecord 1
             10 -> pure InternalRecord
             11 -> pure InternalRecord
             _ ->
@@ -328,13 +331,13 @@ recordParser = do
                 (column, consumedSize) <- variantParserWithSize
                 (column :) <$> columnsParser (size - fromIntegral consumedSize)
 
-indexPayloadParser :: BG.Get IndexPayload
+indexPayloadParser :: BG.Get (TableRecord, RowId)
 indexPayloadParser = do
-    [key, rowId] <- recordParser
-    pure $ IndexPayload key rowId
+    [key, NumericRecord rowId] <- recordParser
+    pure ([key], fromIntegral rowId)
 
 data ObjectType = TableObject | IndexObject | ViewObject | TriggerObject
-    deriving (Show)
+    deriving (Show, Eq)
 
 textToObjectType :: Text -> ObjectType
 textToObjectType "table" = TableObject
@@ -356,7 +359,7 @@ pageParser :: Word16 -> BG.Get (PageHeader, [PageCell])
 pageParser offset = do
     (header, headerSize) <- pageHeaderParser
     -- assume page header is always 8 bytes
-    cells <- pageCellsParser (offset + headerSize) header
+    cells <- pageCellsParser (offset + headerSize) (traceS "header" header)
     pure (header, cells)
 
 schemaTableParser :: BG.Get [ObjectScema]
@@ -402,6 +405,12 @@ findTable dbFilePath pageSize tableName =
         case find (\obj -> _objectTblName obj == tableName) tables of
             Just table -> pure table
             _ -> fail $ "table \"" <> T.unpack tableName <> "\" not found"
+
+findIndexObject :: FilePath -> Word16 -> Text -> Text -> IO (Maybe ObjectScema)
+findIndexObject dbFilePath pageSize tableName columnName =
+    mmapDbPage dbFilePath pageSize 1 $ do
+        tables <- filter (\obj -> _objectType obj == IndexObject) <$> schemaTableParser
+        pure $ find (\obj -> _objectTblName obj == tableName && _objectName obj == "idx_" <> tableName <> "_" <> columnName) tables
 
 scanTable :: FilePath -> Word16 -> ObjectScema -> IO [PageCell]
 scanTable dbFilePath pageSize table = do
@@ -455,29 +464,25 @@ main = do
                         } -> do
                         let columnNames = (\(Sql.Iden [Sql.Name _ columnName], _) -> T.fromStrict columnName) <$> idens
                         table <- findTable dbFilePath pageSize (T.fromStrict tableName)
-                        selectColumns
-                            dbFilePath
-                            pageSize
-                            table
-                            (T.fromStrict tableName)
-                            columnNames
-                            ( \values ->
-                                case whereCond of
-                                    Just (Sql.BinOp (Sql.Iden [Sql.Name _ name]) [Sql.Name _ "="] left) ->
-                                        case left of
+                        case whereCond of
+                            Just (Sql.BinOp (Sql.Iden [Sql.Name _ "id"]) [Sql.Name _ "="] (Sql.NumLit n)) ->
+                                selectByRowId dbFilePath pageSize table (read $ T.unpack $ T.fromStrict n) columnNames
+                            Just (Sql.BinOp (Sql.Iden [Sql.Name _ name]) [Sql.Name _ "="] equalTo) ->
+                                let equalTo' =
+                                        case equalTo of
                                             (Sql.StringLit _ _ s) ->
-                                                case lookup (T.fromStrict name) values of
-                                                    Just (StringRecord valStr) ->
-                                                        T.fromStrict s == valStr
-                                                    _ -> False
+                                                StringRecord $ T.fromStrict s
                                             (Sql.NumLit n) ->
-                                                case lookup (T.fromStrict name) values of
-                                                    Just (NumericRecord valNum) ->
-                                                        read (T.unpack $ T.fromStrict n) == valNum
-                                                    _ -> False
-                                    Just _ -> error "unsupport"
-                                    Nothing -> True
-                            )
+                                                NumericRecord $ read $ T.unpack $ T.fromStrict n
+                                 in selectColumns
+                                        dbFilePath
+                                        pageSize
+                                        table
+                                        (T.fromStrict tableName)
+                                        columnNames
+                                        (T.fromStrict name)
+                                        equalTo'
+                            _ -> error "not support"
                 Right x -> print x
                 x -> do
                     error "execute sql error"
@@ -486,35 +491,104 @@ sqlDialet :: Dialect
 sqlDialet =
     ansi2011{diAutoincrement = True}
 
-selectColumns :: FilePath -> Word16 -> ObjectScema -> Text -> [Text] -> ([(Text, TableRecordValue)] -> Bool) -> IO ()
-selectColumns dbFilePath pageSize table tableName columnNames pred = do
-    cells <- scanTable dbFilePath pageSize table
-    let schemaColumnNames = getSchemaColumnNames (_objectSql table)
-    let columnIndexes = mapMaybe (`elemIndex` schemaColumnNames) columnNames
-    mapM_
-        ( \case
-            TableLeafCell cell payload ->
-                ( when (pred (zip schemaColumnNames payload)) $
-                    putStrLn $
-                        intercalate "|" $
-                            fmap (\i -> show $ traceS "column payload" payload !! i) columnIndexes
-                )
-        )
-        cells
+selectByRowId :: FilePath -> Word16 -> ObjectScema -> RowId -> [Text] -> IO ()
+selectByRowId dbFilePath pageSize table rowId columnNames = do
+    values <- go (traceS "rowId" rowId) (_objectRootPage table)
+    case values of
+        Just values -> do
+            let schemaColumnNames = getSchemaColumnNames (_objectSql table)
+            let columnIndexes = mapMaybe (`elemIndex` schemaColumnNames) columnNames
+            printColumnValues columnIndexes rowId values
+        _ -> putStrLn "not found"
   where
-    getSchemaColumnNames :: Text -> [Text]
-    getSchemaColumnNames sql =
-        case Sql.parseStatement sqlDialet "" Nothing $ T.toStrict sql of
-            Right (Sql.CreateTable _ columns) ->
-                mapMaybe
-                    ( \case
-                        Sql.TableColumnDef (Sql.ColumnDef (Sql.Name _ name) _ _ _) ->
-                            Just $ T.fromStrict name
-                        _ -> Nothing
-                    )
-                    $ traceS "columns" columns
-            Left err ->
-                []
+    go :: RowId -> Word64 -> IO (Maybe TableRecord)
+    go rowId pageNumber = do
+        (pageHeader, cells) <- mmapDbPage dbFilePath pageSize pageNumber (pageParser 0)
+        -- FIXME: use binary search
+        case dropWhile (\c -> _rowId c < rowId) cells of
+            (TableInteriorCell leftChildPageNumber rid) : _ ->
+                go rowId $ fromIntegral leftChildPageNumber
+            (TableLeafCell rid values) : _ ->
+                if rid == rowId
+                    then pure $ Just values
+                    else pure Nothing
+            _ -> pure Nothing
+
+selectColumns :: FilePath -> Word16 -> ObjectScema -> Text -> [Text] -> Text -> TableRecordValue -> IO ()
+selectColumns dbFilePath pageSize table tableName columnNames name equalTo = do
+    foundIndexObject <- findIndexObject dbFilePath pageSize tableName name
+    case foundIndexObject of
+        Just indexObject ->
+            selectByIndex dbFilePath pageSize table (traceS "indexObject" indexObject) name equalTo
+        _ -> do
+            cells <- scanTable dbFilePath pageSize table
+            let schemaColumnNames = getSchemaColumnNames (_objectSql table)
+            let columnIndexes = mapMaybe (`elemIndex` schemaColumnNames) columnNames
+            mapM_
+                ( \case
+                    TableLeafCell rowId payload ->
+                        ( when (pred (zip schemaColumnNames payload)) $
+                            printColumnValues columnIndexes rowId payload
+                        )
+                )
+                cells
+  where
+    hasIndex :: ObjectScema -> Text -> Bool
+    hasIndex = undefined
+
+    selectByIndex :: FilePath -> Word16 -> ObjectScema -> ObjectScema -> Text -> TableRecordValue -> IO ()
+    selectByIndex dbFilePath pageSize table indexObject columnName equalTo = do
+        rowId <- go equalTo (_objectRootPage indexObject)
+        case rowId of
+            Just rowId -> do
+                selectByRowId dbFilePath pageSize table rowId []
+            Nothing -> putStrLn "not found"
+      where
+        go :: TableRecordValue -> Word64 -> IO (Maybe RowId)
+        go indexKey pageNumber = do
+            (pageHeader, cells) <- mmapDbPage dbFilePath pageSize pageNumber (pageParser 0)
+            -- FIXME: use binary search
+            case dropWhile (\c -> head (_recordValues c) < indexKey) cells of
+                (IndexInteriorCell leftChildPageNumber rid [key]) : _ ->
+                    go indexKey $ fromIntegral leftChildPageNumber
+                (IndexLeafCell rid [key]) : _ ->
+                    if key == indexKey
+                        then pure $ Just rid
+                        else pure Nothing
+                _ -> pure Nothing
+
+    pred :: ([(Text, TableRecordValue)] -> Bool)
+    pred values =
+        case lookup name values of
+            Just val -> val == equalTo
+            _ -> False
+
+printColumnValues :: [Int] -> RowId -> [TableRecordValue] -> IO ()
+printColumnValues columnIndexes rowId payload =
+    putStrLn $
+        intercalate "|" $
+            fmap
+                ( \i ->
+                    if i == 0
+                        then show rowId
+                        else
+                            show $ payload !! i
+                )
+                columnIndexes
+
+getSchemaColumnNames :: Text -> [Text]
+getSchemaColumnNames sql =
+    case Sql.parseStatement sqlDialet "" Nothing $ T.toStrict sql of
+        Right (Sql.CreateTable _ columns) ->
+            mapMaybe
+                ( \case
+                    Sql.TableColumnDef (Sql.ColumnDef (Sql.Name _ name) _ _ _) ->
+                        Just $ T.fromStrict name
+                    _ -> Nothing
+                )
+                columns
+        Left err ->
+            []
 
 selectCountStar :: FilePath -> Word16 -> ObjectScema -> IO Int
 selectCountStar dbFilePath pageSize table = do
@@ -523,38 +597,15 @@ selectCountStar dbFilePath pageSize table = do
 
 mmapDbPage :: (Show a) => FilePath -> Word16 -> Word64 -> BG.Get a -> IO a
 mmapDbPage path pageSize pageIndex parser = do
-    mmapFileByteString
-        path
-        ( Just $
-            if pageIndex == 1
-                then (100, fromIntegral pageSize - 100)
-                else
-                    ( fromIntegral pageSize * fromIntegral (pageIndex - 1)
-                    , fromIntegral pageSize
-                    )
-        )
-        (BG.runGet parser . BL.fromStrict)
-  where
-    -- \| Maps region of file and returns it as 'BS.ByteString'.  File is
-    -- mapped in in 'ReadOnly' mode. See 'mmapFilePtr' for details.
-    mmapFileByteString ::
-        (Show a) =>
-        FilePath ->
-        -- \^ name of file to map
-        Maybe (Int64, Int) ->
-        -- \^ range to map, maps whole file if Nothing
-        (BS.ByteString -> a) ->
-        IO a
-    -- \^ bytestring with file contents
-    mmapFileByteString filepath range parse = do
-        mmapWithFilePtr
-            filepath
-            MMap.ReadOnly
-            range
-            ( \(ptr, size) -> do
-                fptr <- newForeignPtr_ (castPtr ptr :: Ptr Word8)
-                let bs = BS.fromForeignPtr fptr 0 (fromIntegral size)
-                let res = parse bs
-                putStr $ show $ last $ show res
-                pure res
+    bs <-
+        mmapFileByteString
+            path
+            ( Just $
+                if pageIndex == 1
+                    then (100, fromIntegral pageSize - 100)
+                    else
+                        ( fromIntegral pageSize * fromIntegral (pageIndex - 1)
+                        , fromIntegral pageSize
+                        )
             )
+    pure $ BG.runGet parser $ BL.fromStrict bs
