@@ -3,13 +3,14 @@
 
 module Main (main) where
 
-import Control.Monad (forM_, when)
+import Control.Monad (forM, forM_, when)
 import Data.Binary (Binary (get), Word16, Word32, Word64, Word8)
 import Data.Binary.Get qualified as BG
 import Data.Bits (Bits (shiftL, (.&.), (.|.)))
 import Data.ByteString qualified as BS
 import Data.ByteString.Internal qualified as BS (fromForeignPtr)
 import Data.ByteString.Lazy qualified as BL
+import Data.Function ((&))
 import Data.Graph (Table)
 import Data.Int (Int64)
 import Data.List (elemIndex, find, findIndex, findIndices, intercalate)
@@ -544,15 +545,50 @@ selectColumns dbFilePath pageSize table tableName columnNames whereCond = do
             )
             cells
 
+    headEquals :: (Eq a) => a -> [a] -> Bool
+    headEquals x (h : _) = x == h
+    headEquals _ _ = False
+
+    headLessThan :: (Ord a) => a -> [a] -> Bool
+    headLessThan x (h : _) = h < x
+    headLessThan _ _ = False
+
+    takeWhileAnd1More pred xs =
+        case span pred xs of
+            (ys, []) -> ys
+            (ys, h : _) -> h : ys
+
     selectByIndex :: TableRecordValue -> Word64 -> IO [RowId]
     selectByIndex indexValue pageNumber = do
         (pageHeader, cells) <- mmapDbPage dbFilePath pageSize pageNumber (pageParser 0)
-        case dropWhile (\c -> head (_recordValues c) < indexValue) cells of
-            (IndexInteriorCell leftChildPageNumber _ _) : _ ->
-                selectByIndex indexValue $ fromIntegral leftChildPageNumber
-            cs@((IndexLeafCell _ _) : _) ->
-                pure $ map _rowId $ takeWhile (\c -> head (_recordValues c) == indexValue) cs
-            [] -> selectByIndex indexValue $ fromIntegral $ fromJust $ _rightmostPointer pageHeader
+        case _pageType pageHeader of
+            IndexLeafPage ->
+                cells
+                    & dropWhile (\c -> headLessThan indexValue (_recordValues c))
+                    & takeWhile (\c -> headEquals indexValue (_recordValues c))
+                    & map _rowId
+                    & pure
+            IndexInteriorPage -> do
+                -- print $ "record values: " ++ show (map _recordValues cells)
+                let cs =
+                        cells
+                            & dropWhile (\c -> headLessThan indexValue (_recordValues c))
+                            & takeWhileAnd1More (\c -> headEquals indexValue (_recordValues c))
+                case cs of
+                    [] ->
+                        case _rightmostPointer pageHeader of
+                            Nothing -> pure []
+                            Just rightmostPointer ->
+                                selectByIndex indexValue $ fromIntegral rightmostPointer
+                    _ -> do
+                        ress <- forM cs $ \(IndexInteriorCell leftChildPageNumber rowId values) -> do
+                            res <- selectByIndex indexValue $ fromIntegral leftChildPageNumber
+                            if headEquals indexValue values
+                                then pure $ rowId : res
+                                else pure res
+
+                        pure $ concat ress
+            _ -> pure []
 
 printColumnValues :: [Int] -> RowId -> [TableRecordValue] -> IO ()
 printColumnValues columnIndexes rowId payload =
